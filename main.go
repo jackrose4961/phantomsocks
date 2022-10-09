@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +16,9 @@ import (
 	proxy "github.com/macronut/phantomsocks/proxy"
 )
 
+var LogLevel int = 0
+var MaxProcs int = 1
+var PassiveMode bool = false
 var allowlist map[string]bool = nil
 
 func ListenAndServe(listenAddr string, serve func(net.Conn)) {
@@ -102,6 +104,8 @@ func DNSServer(listenAddr string) error {
 	defer conn.Close()
 
 	fmt.Println("DNS:", listenAddr)
+	go ListenAndServe(listenAddr, ptcp.DNSTCPServer)
+
 	data := make([]byte, 512)
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(data)
@@ -112,71 +116,50 @@ func DNSServer(listenAddr string) error {
 		request := make([]byte, n)
 		copy(request, data[:n])
 		go func(clientAddr *net.UDPAddr, request []byte) {
-			response := ptcp.NSRequest(request, true)
+			_, response := ptcp.NSRequest(request, true)
 			conn.WriteToUDP(response, clientAddr)
 		}(clientAddr, request)
 	}
 }
 
-var StartFlags struct {
-	ConfigFiles     string `json:"config,omitempty"`
-	HostsFile       string `json:"hosts,omitempty"`
-	SocksListenAddr string `json:"socks,omitempty"`
-	PacListenAddr   string `json:"pac,omitempty"`
-	SniListenAddr   string `json:"sni,omitempty"`
-	RedirectAddr    string `json:"redir,omitempty"`
-	SSListenAddr    string `json:"ss,omitempty"`
-	SystemProxy     string `json:"proxy,omitempty"`
-	DnsListenAddr   string `json:"dns,omitempty"`
-	Device          string `json:"device,omitempty"`
-	UDPDevice       string `json:"udpdev,omitempty"`
-	Clients         string `json:"clients,omitempty"`
-	LogLevel        int    `json:"log,omitempty"`
-	MaxProcs        int    `json:"maxprocs,omitempty"`
-}
-
 func StartService() {
-	if StartFlags.ConfigFiles == "" {
-		conf, err := os.Open("phantomsocks.json")
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		bytes, err := ioutil.ReadAll(conf)
-		if err != nil {
-			log.Panic(err)
-		}
-		conf.Close()
-
-		err = json.Unmarshal(bytes, &StartFlags)
-		if err != nil {
-			log.Panic(err)
-		}
-
-		if StartFlags.ConfigFiles == "" {
-			StartFlags.ConfigFiles = "default.conf"
-		}
+	conf, err := os.Open("config.json")
+	if err != nil {
+		fmt.Println(err)
+		return
 	}
 
-	if StartFlags.MaxProcs > 0 {
-		runtime.GOMAXPROCS(StartFlags.MaxProcs)
+	bytes, err := ioutil.ReadAll(conf)
+	if err != nil {
+		log.Panic(err)
+	}
+	conf.Close()
+
+	var ServiceConfig struct {
+		ConfigFiles       string `json:"config,omitempty"`
+		HostsFile         string `json:"hosts,omitempty"`
+		SystemProxy       string `json:"proxy,omitempty"`
+		Clients           string `json:"clients,omitempty"`
+		VirtualAddrPrefix int    `json:"vaddrprefix,omitempty"`
+
+		Services   []ptcp.ServiceConfig   `json:"services,omitempty"`
+		Interfaces []ptcp.InterfaceConfig `json:"interfaces,omitempty"`
 	}
 
-	devices := strings.Split(StartFlags.Device, ",")
-	ptcp.ConnectionMonitor(devices)
-
-	if StartFlags.UDPDevice != "" {
-		udpdevices := strings.Split(StartFlags.UDPDevice, ",")
-		if !ptcp.UDPMonitor(udpdevices) {
-			return
-		}
+	err = json.Unmarshal(bytes, &ServiceConfig)
+	if err != nil {
+		log.Panic(err)
 	}
 
-	ptcp.LogLevel = StartFlags.LogLevel
-	ptcp.Init()
+	if MaxProcs > 0 {
+		runtime.GOMAXPROCS(MaxProcs)
+	}
 
-	for _, filename := range strings.Split(StartFlags.ConfigFiles, ",") {
+	ptcp.LogLevel = LogLevel
+	ptcp.PassiveMode = PassiveMode
+	devices := ptcp.CreateInterfaces(ServiceConfig.Interfaces)
+
+	for _, filename := range strings.Split(ServiceConfig.ConfigFiles, ",") {
 		err := ptcp.LoadConfig(filename)
 		if err != nil {
 			if ptcp.LogLevel > 0 {
@@ -185,8 +168,8 @@ func StartService() {
 			return
 		}
 	}
-	if StartFlags.HostsFile != "" {
-		err := ptcp.LoadHosts(StartFlags.HostsFile)
+	if ServiceConfig.HostsFile != "" {
+		err := ptcp.LoadHosts(ServiceConfig.HostsFile)
 		if err != nil {
 			if ptcp.LogLevel > 0 {
 				log.Println(err)
@@ -195,52 +178,56 @@ func StartService() {
 		}
 	}
 
-	if StartFlags.Clients != "" {
+	if ServiceConfig.Clients != "" {
 		allowlist = make(map[string]bool)
-		list := strings.Split(StartFlags.Clients, ",")
+		list := strings.Split(ServiceConfig.Clients, ",")
 		for _, c := range list {
 			allowlist[c] = true
 		}
 	}
 
-	if StartFlags.SocksListenAddr != "" {
-		fmt.Println("Socks:", StartFlags.SocksListenAddr)
-		go ListenAndServe(StartFlags.SocksListenAddr, ptcp.SocksProxy)
-		if StartFlags.PacListenAddr != "" {
-			go PACServer(StartFlags.PacListenAddr, StartFlags.SocksListenAddr)
+	default_socks := ""
+	for _, service := range ServiceConfig.Services {
+		switch service.Protocol {
+		case "dns":
+			go DNSServer(service.Address)
+		case "socks":
+			fmt.Println("Socks:", service.Address)
+			go ListenAndServe(service.Address, ptcp.SocksProxy)
+			go ptcp.SocksUDPProxy(service.Address)
+			default_socks = service.Address
+		case "redirect":
+			fmt.Println("Redirect:", service.Address)
+			go ListenAndServe(service.Address, ptcp.RedirectProxy)
+		case "tproxy":
+			fmt.Println("TProxy:", service.Address)
+			go ptcp.TProxyUDP(service.Address)
+		case "wireguard":
+			fmt.Println("WireGuard:", service.Address)
+			wgService := ptcp.WireGuardServiceConfig{service}
+			go wgService.StartService()
+		case "pac":
+			if default_socks != "" {
+				go PACServer(service.Address, default_socks)
+			}
+		case "sniproxy":
+			fmt.Println("SNI:", service.Address)
+			go ListenAndServe(service.Address, ptcp.SNIProxy)
+			go ptcp.QUICProxy(service.Address)
 		}
 	}
 
-	if StartFlags.SniListenAddr != "" {
-		fmt.Println("SNI:", StartFlags.SniListenAddr)
-		go ListenAndServe(StartFlags.SniListenAddr, ptcp.SNIProxy)
-	}
-
-	if StartFlags.SSListenAddr != "" {
-		addr := StartFlags.SSListenAddr
-		if strings.HasPrefix(addr, "ss://") {
-			accesskey := base64.StdEncoding.EncodeToString([]byte(addr[5:]))
-			fmt.Println("ss://" + accesskey)
-			ptcp.ShadowsocksServer(StartFlags.SSListenAddr)
-		}
-	}
-
-	if StartFlags.RedirectAddr != "" {
-		fmt.Println("Redirect:", StartFlags.RedirectAddr)
-		go ListenAndServe(StartFlags.RedirectAddr, ptcp.RedirectProxy)
-	}
-
-	if StartFlags.SystemProxy != "" {
+	if ServiceConfig.SystemProxy != "" {
 		for _, dev := range devices {
-			err := proxy.SetProxy(dev, StartFlags.SystemProxy, true)
+			err := proxy.SetProxy(dev, ServiceConfig.SystemProxy, true)
 			if err != nil {
 				fmt.Println(err)
 			}
 		}
 	}
 
-	if StartFlags.DnsListenAddr != "" {
-		go DNSServer(StartFlags.DnsListenAddr)
+	if ServiceConfig.VirtualAddrPrefix != 0 {
+		ptcp.VirtualAddrPrefix = byte(ServiceConfig.VirtualAddrPrefix)
 	}
 
 	c := make(chan os.Signal, 1)
@@ -248,9 +235,9 @@ func StartService() {
 	s := <-c
 	fmt.Println(s)
 
-	if StartFlags.SystemProxy != "" {
+	if ServiceConfig.SystemProxy != "" {
 		for _, dev := range devices {
-			err := proxy.SetProxy(dev, StartFlags.SystemProxy, false)
+			err := proxy.SetProxy(dev, ServiceConfig.SystemProxy, false)
 			if err != nil {
 				fmt.Println(err)
 			}
@@ -267,20 +254,9 @@ func main() {
 	var flagServiceStop bool
 
 	if len(os.Args) > 1 {
-		flag.StringVar(&StartFlags.ConfigFiles, "c", "default.conf", "Config")
-		flag.StringVar(&StartFlags.HostsFile, "hosts", "", "Hosts")
-		flag.StringVar(&StartFlags.SocksListenAddr, "socks", "", "Socks5")
-		flag.StringVar(&StartFlags.PacListenAddr, "pac", "", "PACServer")
-		flag.StringVar(&StartFlags.SniListenAddr, "sni", "", "SNIProxy")
-		flag.StringVar(&StartFlags.SSListenAddr, "ss", "", "Shadowsocks")
-		flag.StringVar(&StartFlags.RedirectAddr, "redir", "", "Redirect")
-		flag.StringVar(&StartFlags.SystemProxy, "proxy", "", "Proxy")
-		flag.StringVar(&StartFlags.DnsListenAddr, "dns", "", "DNS")
-		flag.StringVar(&StartFlags.Device, "device", "", "Device")
-		flag.StringVar(&StartFlags.UDPDevice, "udpdev", "", "UDP Device")
-		flag.StringVar(&StartFlags.Clients, "clients", "", "Clients")
-		flag.IntVar(&StartFlags.LogLevel, "log", 0, "LogLevel")
-		flag.IntVar(&StartFlags.MaxProcs, "maxprocs", 0, "LogLevel")
+		flag.IntVar(&LogLevel, "log", 0, "LogLevel")
+		flag.IntVar(&MaxProcs, "maxprocs", 0, "MaxProcesses")
+		flag.BoolVar(&PassiveMode, "passive", false, "PassiveMode")
 		flag.BoolVar(&flagServiceInstall, "install", false, "Install service")
 		flag.BoolVar(&flagServiceRemove, "remove", false, "Remove service")
 		flag.BoolVar(&flagServiceStart, "start", false, "Start service")

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/url"
 	"strconv"
@@ -14,21 +16,25 @@ import (
 	"time"
 )
 
-type DomainIP struct {
-	Index     int
+type RecordAddresses struct {
 	TTL       int64
 	Addresses []net.IP
 }
 
-var DNS string = ""
+type DNSRecords struct {
+	Index int
+	Hint  uint
+	A     *RecordAddresses
+	AAAA  *RecordAddresses
+}
+
 var DNSMinTTL uint32 = 0
-var ACache sync.Map
-var AAAACache sync.Map
-var HTTPSCache sync.Map
+var VirtualAddrPrefix byte = 255
+var DNSCache sync.Map
 var Nose []string = []string{"phantom.socks"}
 var NoseLock sync.Mutex
 
-func TCPlookup(request []byte, address string, server *PhantomServer) ([]byte, error) {
+func TCPlookup(request []byte, address string, server *PhantomInterface) ([]byte, error) {
 	data := make([]byte, 1024)
 	binary.BigEndian.PutUint16(data[:2], uint16(len(request)))
 	copy(data[2:], request)
@@ -36,44 +42,39 @@ func TCPlookup(request []byte, address string, server *PhantomServer) ([]byte, e
 	var conn net.Conn
 	var err error = nil
 	if server != nil {
-		addr, err := net.ResolveTCPAddr("tcp", address)
+		host, port := splitHostPort(address)
+		conn, _, err = server.Dial(host, port, data[:len(request)+2])
 		if err != nil {
 			return nil, err
 		}
-		conn, err = server.Dial([]net.IP{addr.IP}, addr.Port, data[:len(request)+2])
 	} else {
 		conn, err = net.DialTimeout("tcp", address, time.Second*5)
 		if err != nil {
 			return nil, err
 		}
 
-		defer conn.Close()
-
 		_, err = conn.Write(data[:len(request)+2])
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
+	defer conn.Close()
 
-	if err != nil {
+	n, err := conn.Read(data)
+	if err != nil || n < 2 {
 		return nil, err
 	}
-
-	length := 0
-	recvlen := 0
-	for {
-		if recvlen >= 1024 {
-			return nil, nil
-		}
-		n, err := conn.Read(data[recvlen:])
+	length := int(binary.BigEndian.Uint16(data[:2]) + 2)
+	recvlen := n
+	for recvlen < length && n > 0 {
+		n, err = conn.Read(data[recvlen:])
 		if err != nil {
 			return nil, err
 		}
-		if length == 0 {
-			length = int(binary.BigEndian.Uint16(data[:2]) + 2)
-		}
 		recvlen += n
-		if recvlen >= length {
-			return data[2:recvlen], nil
-		}
 	}
+	return data[2:recvlen], nil
 }
 
 func TCPlookupDNS64(request []byte, address string, offset int, prefix []byte) ([]byte, error) {
@@ -212,45 +213,42 @@ func TLSlookup(request []byte, address string) ([]byte, error) {
 		return nil, err
 	}
 
-	length := 0
-	recvlen := 0
-	for {
-		n, err := conn.Read(data[recvlen:])
+	n, err := conn.Read(data)
+	if err != nil || n < 2 {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(data[:2]) + 2)
+	recvlen := n
+	for recvlen < length && n > 0 {
+		n, err = conn.Read(data[recvlen:])
 		if err != nil {
 			return nil, err
 		}
-		if length == 0 {
-			length = int(binary.BigEndian.Uint16(data[:2]) + 2)
-		}
 		recvlen += n
-		if recvlen >= length {
-			return data[2:recvlen], nil
-		}
 	}
+	return data[2:recvlen], nil
 }
 
-func HTTPSlookup(request []byte, u *url.URL, host string) ([]byte, error) {
+func HTTPSlookup(request []byte, u *url.URL, domain string) ([]byte, error) {
 	address := u.Host
-	serverName, _, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		serverName = address
+		host = address
+		port = "443"
 		address += ":443"
 	}
 
-	path := u.Path
-	if path == "" {
-		path = "/dns-query"
+	if domain == "" {
+		domain = host
 	}
-
-	if net.ParseIP(serverName) != nil {
-		serverName = host
-	} else if host == "" {
-		host = serverName
+	path := u.Path
+	if port != "443" {
+		host = address
 	}
 
 	conf := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         serverName,
+		ServerName:         domain,
 	}
 	conn, err := tls.Dial("tcp", address, conf)
 	if err != nil {
@@ -305,8 +303,6 @@ func HTTPSlookup(request []byte, u *url.URL, host string) ([]byte, error) {
 			return nil, err
 		}
 	}
-
-	return nil, nil
 }
 
 func TFOlookup(request []byte, address string) ([]byte, error) {
@@ -321,29 +317,32 @@ func TFOlookup(request []byte, address string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, _, err = DialConnInfo(nil, addr, &PhantomServer{OPT_TFO, 2, 0, 0, "", ""}, data[:len(request)+2])
+	conn, _, err = DialConnInfo(
+		nil, addr,
+		&PhantomInterface{
+			Hint: OPT_TFO,
+			TTL:  1,
+		},
+		data[:len(request)+2],
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	length := 0
-	recvlen := 0
-	for {
-		if recvlen >= 1024 {
-			return nil, nil
-		}
-		n, err := conn.Read(data[recvlen:])
+	n, err := conn.Read(data)
+	if err != nil || n < 2 {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(data[:2]) + 2)
+	recvlen := n
+	for recvlen < length && n > 0 {
+		n, err = conn.Read(data[recvlen:])
 		if err != nil {
 			return nil, err
 		}
-		if length == 0 {
-			length = int(binary.BigEndian.Uint16(data[:2]) + 2)
-		}
 		recvlen += n
-		if recvlen >= length {
-			return data[2:recvlen], nil
-		}
 	}
+	return data[2:recvlen], nil
 }
 
 func GetQName(buf []byte) (string, int, int) {
@@ -436,45 +435,45 @@ func GetNameOffset(response []byte, offset int) int {
 	return offset
 }
 
-func getAnswers(response []byte) ([]net.IP, int64) {
+func getAnswers(response []byte) *RecordAddresses {
 	responseLen := len(response)
 
 	offset := 12
 	if offset > responseLen {
-		return nil, 0
+		return nil
 	}
 
 	QDCount := int(binary.BigEndian.Uint16(response[4:6]))
 	ANCount := int(binary.BigEndian.Uint16(response[6:8]))
 
 	if ANCount == 0 {
-		return nil, 0
+		return &RecordAddresses{0, nil}
 	}
 
 	for i := 0; i < QDCount; i++ {
 		_offset := GetNameOffset(response, offset)
 		if _offset == 0 {
-			return nil, 0
+			return nil
 		}
 		offset = _offset + 4
 	}
 
-	ips := make([]net.IP, 0)
+	var ips []net.IP
 	var ttl uint32 = 65535
 	cname := ""
 	for i := 0; i < ANCount; i++ {
 		_offset := GetNameOffset(response, offset)
 		if _offset == 0 {
-			return nil, 0
+			return nil
 		}
 		offset = _offset
 		if offset+2 > responseLen {
-			return nil, 0
+			return nil
 		}
 		AType := binary.BigEndian.Uint16(response[offset : offset+2])
 		offset += 4
 		if offset+4 > responseLen {
-			return nil, 0
+			return nil
 		}
 		TTL := binary.BigEndian.Uint32(response[offset : offset+4])
 		if TTL < ttl {
@@ -482,14 +481,14 @@ func getAnswers(response []byte) ([]net.IP, int64) {
 		}
 		offset += 4
 		if offset+2 > responseLen {
-			return nil, 0
+			return nil
 		}
 		DataLength := binary.BigEndian.Uint16(response[offset : offset+2])
 		offset += 2
 
 		if AType == 1 {
 			if offset+4 > responseLen {
-				return nil, 0
+				return nil
 			}
 			data := response[offset : offset+4]
 			ip := net.IPv4(data[0], data[1], data[2], data[3])
@@ -497,7 +496,7 @@ func getAnswers(response []byte) ([]net.IP, int64) {
 		} else if AType == 28 {
 			var data [16]byte
 			if offset+16 > responseLen {
-				return nil, 0
+				return nil
 			}
 			copy(data[:], response[offset:offset+16])
 			ip := net.IP(response[offset : offset+16])
@@ -518,12 +517,27 @@ func getAnswers(response []byte) ([]net.IP, int64) {
 		ttl = DNSMinTTL
 	}
 
-	return ips, int64(ttl) + time.Now().Unix()
+	return &RecordAddresses{int64(ttl) + time.Now().Unix(), ips}
 }
 
-func packAnswers(qtype int, ttl uint32, ips []net.IP) (int, []byte) {
+func packAnswers(qtype int, ttl uint32, records DNSRecords) (int, []byte) {
 	totalLen := 0
 	count := 0
+	var ips []net.IP
+	switch qtype {
+	case 1:
+		if records.A == nil {
+			return 0, nil
+		}
+		ips = records.A.Addresses
+	case 28:
+		if records.AAAA == nil {
+			return 0, nil
+		}
+		ips = records.AAAA.Addresses
+	case 65:
+		return 0, nil
+	}
 	for _, ip := range ips {
 		ip4 := ip.To4()
 		if ip4 != nil {
@@ -573,64 +587,70 @@ func packAnswers(qtype int, ttl uint32, ips []net.IP) (int, []byte) {
 	return count, answers
 }
 
-func BuildResponse(request []byte, qtype int, ttl uint32, ips []net.IP) []byte {
+func (records DNSRecords) BuildResponse(request []byte, qtype int, ttl uint32) []byte {
 	response := make([]byte, 1024)
 	copy(response, request)
 	length := len(request)
 	response[2] = 0x81
 	response[3] = 0x80
 
-	if len(ips) == 0 {
-		return response[:length]
-	}
+	if records.Index > 0 {
+		switch qtype {
+		case 1:
+			answer := []byte{0xC0, 0x0C, 0x00, 1,
+				0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x04,
+				VirtualAddrPrefix, 0}
+			copy(response[length:], answer)
+			length += 14
+			binary.BigEndian.PutUint16(response[length:], uint16(records.Index))
+			length += 2
+			binary.BigEndian.PutUint16(response[6:], 1)
+		case 28:
+			return response[:length]
 
-	count, answer := packAnswers(qtype, ttl, ips)
-	binary.BigEndian.PutUint16(response[6:], uint16(count))
-	if count > 0 {
-		copy(response[length:], answer)
-		length += len(answer)
-	}
-
-	return response[:length]
-}
-
-func BuildLie(request []byte, qtype int, id int) []byte {
-	response := make([]byte, 1024)
-	copy(response, request)
-	length := len(request)
-	response[2] = 0x81
-	response[3] = 0x80
-	switch qtype {
-	case 1:
-		answer := []byte{0xC0, 0x0C, 0x00, 1,
-			0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x04,
-			6, 0}
-		copy(response[length:], answer)
-		length += 14
-		binary.BigEndian.PutUint16(response[length:], uint16(id))
-		length += 2
-		binary.BigEndian.PutUint16(response[6:], 1)
-	case 28:
-		answer := []byte{0xC0, 0x0C, 0x00, 28,
-			0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10,
-			0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00}
-		copy(response[length:], answer)
-		length += 24
-		binary.BigEndian.PutUint32(response[length:], uint32(id))
-		length += 4
-		binary.BigEndian.PutUint16(response[6:], 1)
-	case 65:
-		answer := []byte{0xC0, 0x0C, 0x00, 65,
-			0, 1, 0, 0, 0, 16, 0, 18,
-			0, 1, 0,
-			0, 1, 0, 3, 2, 0x68, 0x32,
-			0, 4, 0, 4, 6, 0}
-		copy(response[length:], answer)
-		length += 28
-		binary.BigEndian.PutUint16(response[length:], uint16(id))
-		length += 2
-		binary.BigEndian.PutUint16(response[6:], 1)
+			answer := []byte{0xC0, 0x0C, 0x00, 28,
+				0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10,
+				0x00, 0x64, 0xff, VirtualAddrPrefix, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00}
+			copy(response[length:], answer)
+			length += 24
+			binary.BigEndian.PutUint32(response[length:], uint32(records.Index))
+			length += 4
+			binary.BigEndian.PutUint16(response[6:], 1)
+		case 65:
+			copy(response[length:], []byte{0xC0, 0x0C, 0x00, 65, 0, 1, 0, 0, 0, 16, 0, 0, 0, 1, 0})
+			dataLenOffset := length + 10
+			length += 15
+			if records.Hint&(OPT_HTTPS|OPT_HTTP3) != 0 {
+				copy(response[length:], []byte{0, 1, 0, 0})
+				svcLenOffset := length + 2
+				length += 4
+				if records.Hint&OPT_HTTP3 != 0 {
+					copy(response[length:], []byte{2, 0x68, 0x33})
+					length += 3
+					copy(response[length:], []byte{5, 0x68, 0x33, 0x2d, 0x32, 0x39})
+					length += 6
+				}
+				if records.Hint&OPT_HTTPS != 0 {
+					copy(response[length:], []byte{2, 0x68, 0x32})
+					length += 3
+				}
+				binary.BigEndian.PutUint16(response[svcLenOffset:], uint16(length-svcLenOffset-2))
+			}
+			copy(response[length:], []byte{0, 4, 0, 4, VirtualAddrPrefix, 0})
+			length += 6
+			binary.BigEndian.PutUint16(response[length:], uint16(records.Index))
+			length += 2
+			binary.BigEndian.PutUint16(response[6:], 1)
+			binary.BigEndian.PutUint16(response[dataLenOffset:], uint16(length-dataLenOffset-2))
+		}
+	} else {
+		count, answer := packAnswers(qtype, ttl, records)
+		if count > 0 {
+			binary.BigEndian.PutUint16(response[6:], uint16(count))
+			copy(response[length:], answer)
+			length += len(answer)
+		}
 	}
 
 	return response[:length]
@@ -656,10 +676,10 @@ func PackQName(name string) []byte {
 }
 
 type ServerOptions struct {
-	ECS  string
-	Type string
-	PD   string
-	Host string
+	ECS    string
+	Type   string
+	PD     string
+	Domain string
 }
 
 func ParseOptions(options string) ServerOptions {
@@ -675,8 +695,8 @@ func ParseOptions(options string) ServerOptions {
 				serverOpts.PD = key[1]
 			case "type":
 				serverOpts.Type = key[1]
-			case "host":
-				serverOpts.Host = key[1]
+			case "domain":
+				serverOpts.Domain = key[1]
 			}
 		}
 	}
@@ -759,62 +779,61 @@ func PackRequest(name string, qtype uint16, id uint16, ecs string) []byte {
 	return Request[:length]
 }
 
-func LoadDNSCache(qname string, qtype uint16) (DomainIP, bool) {
+func LoadDNSCache(qname string) *DNSRecords {
 	var ok bool
 	var result interface{}
-	var answer DomainIP = DomainIP{0, 0, nil}
-	switch qtype {
-	case 1:
-		result, ok = ACache.Load(qname)
-	case 28:
-		result, ok = AAAACache.Load(qname)
-	case 65:
-		result, ok = HTTPSCache.Load(qname)
-	default:
-		return answer, false
-	}
-
+	result, ok = DNSCache.Load(qname)
 	if ok {
-		answer = result.(DomainIP)
+		return result.(*DNSRecords)
 	}
 
-	return answer, ok
+	return nil
 }
 
-func StoreDNSCache(qname string, qtype uint16, answer DomainIP) {
-	switch qtype {
-	case 1:
-		ACache.Store(qname, answer)
-	case 28:
-		AAAACache.Store(qname, answer)
-	}
+func StoreDNSCache(qname string, record *DNSRecords) {
+	DNSCache.Store(qname, record)
 }
 
-func NSLookup(name string, option uint32, server string) (int, []net.IP) {
+func NSLookup(name string, hint uint32, server string) (int, []net.IP) {
 	var qtype uint16 = 1
-	if option&OPT_IPV6 != 0 {
+	if hint&OPT_IPV6 != 0 {
 		qtype = 28
 	}
 
-	answer, ok := LoadDNSCache(name, qtype)
-	if ok {
-		logPrintln(3, "cached:", name, qtype, answer.Addresses)
-		return answer.Index, answer.Addresses
-	}
-	offset := 0
-	for i := 0; i < SubdomainDepth; i++ {
-		off := strings.Index(name[offset:], ".")
-		if off == -1 {
-			break
-		}
-		offset += off
-		answer, ok := LoadDNSCache(name[offset:], qtype)
+	records := LoadDNSCache(name)
+	if records == nil {
+		records = new(DNSRecords)
+		StoreDNSCache(name, records)
 
-		if ok {
-			logPrintln(3, "cached:", name, qtype, i, answer.Addresses)
-			return answer.Index, answer.Addresses
+		offset := 0
+		for i := 0; i < SubdomainDepth; i++ {
+			off := strings.Index(name[offset:], ".")
+			if off == -1 {
+				break
+			}
+			offset += off
+			top := LoadDNSCache(name[offset:])
+			if top != nil {
+				*records = *top
+				break
+			}
+
+			offset++
 		}
-		offset++
+	}
+	switch qtype {
+	case 1:
+		if records.A != nil {
+			logPrintln(3, "cached:", name, qtype, records.A.Addresses)
+			return records.Index, records.A.Addresses
+		}
+	case 28:
+		if records.AAAA != nil {
+			logPrintln(3, "cached:", name, qtype, records.AAAA.Addresses)
+			return records.Index, records.AAAA.Addresses
+		}
+	default:
+		return 0, nil
 	}
 
 	var request []byte
@@ -844,18 +863,17 @@ func NSLookup(name string, option uint32, server string) (int, []net.IP) {
 			response, err = TLSlookup(request, u.Host)
 		case "https":
 			request = PackRequest(name, qtype, uint16(0), options.ECS)
-			response, err = HTTPSlookup(request, u, options.Host)
+			response, err = HTTPSlookup(request, u, options.Domain)
 		case "tfo":
 			request = PackRequest(name, qtype, uint16(0), options.ECS)
 			response, err = TFOlookup(request, u.Host)
 		default:
 			NoseLock.Lock()
-			index := len(Nose)
+			records.Index = len(Nose)
+			records.Hint = uint(hint)
 			Nose = append(Nose, name)
 			NoseLock.Unlock()
-			StoreDNSCache(name, 1, DomainIP{index, 0, nil})
-			StoreDNSCache(name, 28, DomainIP{0, 0, nil})
-			return index, nil
+			return records.Index, nil
 		}
 	}
 	if err != nil {
@@ -863,202 +881,242 @@ func NSLookup(name string, option uint32, server string) (int, []net.IP) {
 		return 0, nil
 	}
 
-	ips, ttl := getAnswers(response)
-	var dns_ttl int64 = int64(ttl) + time.Now().Unix()
-
-	if options.PD != "" {
-		for i, ip := range ips {
-			ips[i] = net.ParseIP(options.PD + ip.String())
-		}
-	}
-	logPrintln(3, "nslookup", name, qtype, ips)
-
-	index := 0
-	if option != 0 {
+	if records.Index == 0 && hint != 0 {
 		NoseLock.Lock()
-		index = len(Nose)
+		records.Index = len(Nose)
+		records.Hint = uint(hint)
 		Nose = append(Nose, name)
 		NoseLock.Unlock()
 	}
 
-	StoreDNSCache(name, qtype, DomainIP{index, dns_ttl, ips})
+	answer := getAnswers(response)
+	if answer == nil {
+		return records.Index, nil
+	}
 
-	return index, ips
+	if options.PD != "" {
+		for i, ip := range answer.Addresses {
+			answer.Addresses[i] = net.ParseIP(options.PD + ip.String())
+		}
+	}
+	logPrintln(3, "nslookup", name, qtype, answer.Addresses)
+	switch qtype {
+	case 1:
+		records.A = answer
+	case 28:
+		records.AAAA = answer
+	}
+
+	return records.Index, answer.Addresses
 }
 
-func NSRequest(request []byte, cache bool) []byte {
+func NSRequest(request []byte, cache bool) (int, []byte) {
 	name, qtype, _ := GetQName(request)
 	if name == "" {
 		logPrintln(2, "DNS Segmentation fault")
-		return nil
+		return 0, nil
 	}
 
-	if qtype != 1 && qtype != 28 && qtype != 65 {
-		return BuildResponse(request, qtype, 3600, nil)
-	}
-
-	id := binary.BigEndian.Uint16(request[:2])
-
+	var records *DNSRecords
 	if cache {
-		answer, ok := LoadDNSCache(name, uint16(qtype))
-		if ok {
-			var ttl int64 = 256
-			if answer.TTL > 0 {
-				ttl = answer.TTL - time.Now().Unix()
-				if ttl < 0 {
-					go NSRequest(request, false)
-				}
-			}
-			if answer.Index > 0 {
-				if qtype == 28 {
-					return BuildResponse(request, qtype, 0, nil)
-				}
-				return BuildLie(request, qtype, answer.Index)
-			} else {
-				return BuildResponse(request, qtype, uint32(ttl), answer.Addresses)
-			}
-		}
+		records = LoadDNSCache(name)
+		if records == nil {
+			records = new(DNSRecords)
+			StoreDNSCache(name, records)
 
-		offset := 0
-		for i := 0; i < SubdomainDepth; i++ {
-			off := strings.Index(name[offset:], ".")
-			if off == -1 {
-				break
-			}
-			offset += off
-			answer, ok := LoadDNSCache(name[offset:], uint16(qtype))
-			if ok {
-				logPrintln(3, "cached:", name, qtype, answer.Addresses)
-				if answer.Index > 0 {
-					if qtype == 28 {
-						return BuildResponse(request, qtype, 0, nil)
-					}
-					return BuildLie(request, qtype, answer.Index)
-				} else {
-					return BuildResponse(request, qtype, 3600, answer.Addresses)
+			offset := 0
+			for i := 0; i < SubdomainDepth; i++ {
+				off := strings.Index(name[offset:], ".")
+				if off == -1 {
+					break
 				}
+				offset += off
+				top := LoadDNSCache(name[offset:])
+				if top != nil {
+					*records = *top
+					break
+				}
+				offset++
 			}
-			offset++
 		}
+	} else {
+		records = new(DNSRecords)
 	}
 
-	if qtype == 65 {
-		return BuildResponse(request, qtype, 3600, nil)
+	switch qtype {
+	case 1:
+		if records.A != nil {
+			return records.Index, records.BuildResponse(request, qtype, 0)
+		}
+	case 28:
+		if records.AAAA != nil {
+			return records.Index, records.BuildResponse(request, qtype, 0)
+		}
+	case 65:
+		if records.Index == 0 && records.Hint&OPT_UDP != 0 {
+			NoseLock.Lock()
+			records.Index = len(Nose)
+			Nose = append(Nose, name)
+			NoseLock.Unlock()
+		}
+		return records.Index, records.BuildResponse(request, qtype, 3600)
+	default:
+		return records.Index, records.BuildResponse(request, qtype, 3600)
 	}
 
 	var response []byte
 	var err error
 
-	conf, ok := ConfigLookup(name)
+	server := ConfigLookup(name)
 	var options ServerOptions
-	var method uint32
-	serverAddr := ""
-	if ok {
-		method = conf.Option
-		logPrintln(2, "request:", name, conf.Server)
-		serverAddr = conf.Server
+	DNS := ""
+	if server != nil {
+		records.Hint = uint(server.Hint)
+		logPrintln(2, "request:", name, server.DNS, server.Protocol)
+		DNS = server.DNS
 	} else {
-		method = 0
-		logPrintln(2, "request:", name, DNS)
-		serverAddr = DNS
+		logPrintln(4, "request:", name, "no answer")
+		return 0, records.BuildResponse(request, qtype, 3600)
 	}
 
-	if serverAddr == "" {
-		return BuildResponse(request, qtype, 3600, nil)
+	if DNS == "" {
+		if records.Index == 0 && server.Protocol != 0 {
+			NoseLock.Lock()
+			records.Index = len(Nose)
+			Nose = append(Nose, name)
+			NoseLock.Unlock()
+		}
+		return records.Index, records.BuildResponse(request, qtype, 3600)
 	}
 
-	u, err := url.Parse(serverAddr)
+	u, err := url.Parse(DNS)
 	if err != nil {
 		logPrintln(1, err)
-		return nil
+		return 0, nil
 	}
 
+	_request := request
 	if u.RawQuery != "" {
 		options = ParseOptions(u.RawQuery)
 
 		if options.Type == "A" && qtype == 28 {
-			return BuildResponse(request, qtype, 0, nil)
+			return records.Index, records.BuildResponse(request, qtype, 0)
 		} else if options.Type == "AAAA" && qtype == 1 {
-			return BuildResponse(request, qtype, 0, nil)
+			return records.Index, records.BuildResponse(request, qtype, 0)
 		}
 
 		_qtype := uint16(qtype)
-		if method&OPT_IPV6 != 0 {
+		if records.Hint&OPT_IPV6 != 0 {
 			_qtype = 28
 		}
 
 		if options.ECS != "" || _qtype != uint16(qtype) {
-			request = PackRequest(name, _qtype, id, options.ECS)
+			id := binary.BigEndian.Uint16(request[:2])
+			_request = PackRequest(name, _qtype, id, options.ECS)
 		}
 	}
 
 	switch u.Scheme {
 	case "udp":
-		response, err = UDPlookup(request, u.Host)
+		response, err = UDPlookup(_request, u.Host)
 	case "tcp":
-		response, err = TCPlookup(request, u.Host, nil)
+		response, err = TCPlookup(_request, u.Host, nil)
 	case "tls":
-		response, err = TLSlookup(request, u.Host)
+		response, err = TLSlookup(_request, u.Host)
 	case "https":
-		response, err = HTTPSlookup(request, u, options.Host)
+		response, err = HTTPSlookup(_request, u, options.Domain)
 	case "tfo":
-		response, err = TFOlookup(request, u.Host)
+		response, err = TFOlookup(_request, u.Host)
 	default:
-		if method != 0 {
-			NoseLock.Lock()
-			index := len(Nose)
-			Nose = append(Nose, name)
-			NoseLock.Unlock()
-			StoreDNSCache(name, 1, DomainIP{index, 0, nil})
-			StoreDNSCache(name, 28, DomainIP{0, 0, nil})
-			return BuildLie(request, qtype, index)
-		}
 		logPrintln(1, "unknown protocol")
-		return nil
+		return 0, nil
 	}
 
 	if err != nil {
 		logPrintln(1, err)
-		return nil
+		return 0, nil
 	}
 
-	ips, ttl := getAnswers(response)
-	logPrintln(3, "response:", name, qtype, ips)
+	if records.Index == 0 && (records.Hint != 0 || server.Protocol != 0) {
+		NoseLock.Lock()
+		records.Index = len(Nose)
+		Nose = append(Nose, name)
+		NoseLock.Unlock()
+	}
+	answer := getAnswers(response)
+	if answer == nil {
+		logPrintln(4, "request:", name, "no answer")
+		return 0, records.BuildResponse(request, qtype, 0)
+	}
 
 	if options.PD != "" {
-		for i, ip := range ips {
-			ips[i] = net.ParseIP(options.PD + ip.String())
+		for i, ip := range answer.Addresses {
+			answer.Addresses[i] = net.ParseIP(options.PD + ip.String())
 		}
-
-		if method != 0 {
-			if qtype == 28 {
-				return BuildResponse(request, qtype, 0, nil)
-			}
-			NoseLock.Lock()
-			index := len(Nose)
-			Nose = append(Nose, name)
-			NoseLock.Unlock()
-			StoreDNSCache(name, 1, DomainIP{index, ttl, ips})
-			StoreDNSCache(name, 28, DomainIP{0, 0, nil})
-			response = BuildLie(request, qtype, index)
-		} else {
-			StoreDNSCache(name, uint16(qtype), DomainIP{0, ttl, ips})
-			response = BuildResponse(request, qtype, 0, ips)
-		}
-	} else {
-		index := 0
-		if method != 0 {
-			if qtype == 28 {
-				return BuildResponse(request, qtype, 0, nil)
-			}
-			NoseLock.Lock()
-			index = len(Nose)
-			Nose = append(Nose, name)
-			NoseLock.Unlock()
-			response = BuildLie(request, qtype, index)
-		}
-		StoreDNSCache(name, uint16(qtype), DomainIP{index, ttl, ips})
+	}
+	logPrintln(3, "response:", name, qtype, answer.Addresses)
+	switch qtype {
+	case 1:
+		records.A = answer
+	case 28:
+		records.AAAA = answer
 	}
 
-	return response
+	return records.Index, records.BuildResponse(request, qtype, 0)
+}
+
+func (server *PhantomInterface) ResolveTCPAddr(host string, port int) (*net.TCPAddr, error) {
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return &net.TCPAddr{IP: ip, Port: port}, nil
+	}
+
+	_, addrs := NSLookup(host, server.Hint, server.DNS)
+	if len(addrs) == 0 {
+		return nil, errors.New("no such host")
+	}
+	rand.Seed(time.Now().UnixNano())
+	return &net.TCPAddr{IP: addrs[rand.Intn(len(addrs))], Port: port}, nil
+}
+
+func (server *PhantomInterface) ResolveTCPAddrs(host string, port int) ([]*net.TCPAddr, error) {
+	ip := net.ParseIP(host)
+	if ip != nil {
+		tcpAddrs := make([]*net.TCPAddr, 1)
+		tcpAddrs[0] = &net.TCPAddr{IP: ip, Port: port}
+		return tcpAddrs, nil
+	}
+
+	_, addrs := NSLookup(host, server.Hint, server.DNS)
+	if len(addrs) == 0 {
+		return nil, errors.New("no such host")
+	}
+	tcpAddrs := make([]*net.TCPAddr, len(addrs))
+	for i, addr := range addrs {
+		tcpAddrs[i] = &net.TCPAddr{IP: addr, Port: port}
+	}
+
+	return tcpAddrs, nil
+}
+
+func DNSTCPServer(client net.Conn) {
+	defer client.Close()
+
+	data := make([]byte, 2048)
+	n, err := client.Read(data)
+	if err != nil {
+		return
+	}
+	requestLen := int(binary.BigEndian.Uint16(data[:2]))
+	if requestLen > (n - 2) {
+		return
+	}
+	request := make([]byte, requestLen)
+	copy(request, data[2:requestLen-2])
+
+	_, response := NSRequest(request, true)
+	responseLen := len(response)
+	binary.BigEndian.PutUint16(data[:2], uint16(responseLen))
+	copy(data[2:], response)
+	client.Write(data[:responseLen+2])
 }
